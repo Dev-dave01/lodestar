@@ -1,8 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, vec, Address, Env, IntoVal, String,
-    Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, vec, Address, Env,
+    IntoVal, String, Symbol, Vec,
 };
 
 const MAX_TTL: u32 = 100_000_000;
@@ -24,6 +24,12 @@ const FLAG_PENALTY: i32 = -200;
 pub enum AgentError {
     InvalidAmount = 1,
     ArithmeticOverflow = 2,
+    /// `get_score`: the address has never been registered as an agent.
+    AgentNotFound = 3,
+    /// `get_score`: the agent record exists but the agent has been deactivated.
+    AgentInactive = 4,
+    /// `get_score`: the agent record exists but the agent has been flagged.
+    AgentFlagged = 5,
 }
 
 #[contracttype]
@@ -273,28 +279,38 @@ impl LodestarAgents {
         }
     }
 
-    // Get score for an agent
+    // Get score for an agent.
+    //
+    // # Errors
+    // Panics with a distinct `AgentError` variant for each failure cause:
+    // - `AgentError::AgentNotFound` (code 3) — no record exists for `agent_address`.
+    // - `AgentError::AgentInactive` (code 4) — the agent has been deactivated.
+    // - `AgentError::AgentFlagged`  (code 5) — the agent has been flagged.
     //
     // # Events
-    // Emits a `("agents", "score_read", agent_address)` event with payload
-    // `(score, exists)`:
-    //   - `score`  — the agent's current score, or `-1` if no record exists
-    //   - `exists` — `true` if a registered agent record was found, `false`
-    //                otherwise (in which case `score == -1`)
-    //
-    // The payload is self-sufficient: consumers can build an activity feed
-    // without a follow-up `get_agent` read. Note that `get_score` is a view
-    // and does not mutate storage, but the event is still published so
-    // off-chain indexers can observe score reads without polling.
+    // On success, emits a `("agents", "score_read", agent_address)` event with
+    // payload `(score,)` so off-chain indexers can observe score reads without
+    // polling.
     pub fn get_score(env: Env, agent_address: Address) -> i32 {
         let entry = env
             .storage()
             .persistent()
             .get::<DataKey, AgentEntry>(&DataKey::Agent(agent_address.clone()));
-        let (score, exists) = match entry {
-            Some(a) => (a.score, true),
-            None => (-1, false),
+
+        let agent = match entry {
+            Some(a) => a,
+            None => panic_with_error!(&env, AgentError::AgentNotFound),
         };
+
+        if !agent.active {
+            panic_with_error!(&env, AgentError::AgentInactive);
+        }
+
+        if agent.flagged {
+            panic_with_error!(&env, AgentError::AgentFlagged);
+        }
+
+        let score = agent.score;
 
         env.events().publish(
             (
@@ -302,7 +318,7 @@ impl LodestarAgents {
                 Symbol::new(&env, "score_read"),
                 agent_address,
             ),
-            (score, exists),
+            (score,),
         );
 
         score
@@ -1376,12 +1392,94 @@ mod test {
             )
                 .into_val(&env)
         );
-        assert_eq!(
-            <(i32, bool)>::from_val(&env, &event.2),
-            (INITIAL_SCORE, true)
-        );
+        // Payload is now (score,) only — the sentinel `exists` bool was removed
+        // when get_score was updated to panic_with_error! for missing agents.
+        assert_eq!(<(i32,)>::from_val(&env, &event.2), (INITIAL_SCORE,));
     }
 
+    /// `get_score` must panic with `AgentError::AgentNotFound` (code 3) when
+    /// the address has never been registered.
+    #[test]
+    fn test_get_score_panics_agent_not_found() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(LodestarAgents, (admin,));
+        let client = LodestarAgentsClient::new(&env, &contract_id);
+
+        let missing = Address::generate(&env);
+        let result = client.try_get_score(&missing);
+        assert!(result.is_err());
+        let err = result.unwrap_err().unwrap();
+        assert_eq!(err, AgentError::AgentNotFound.into());
+    }
+
+    /// `get_score` must panic with `AgentError::AgentInactive` (code 4) when
+    /// the agent exists but has been deactivated.
+    #[test]
+    fn test_get_score_panics_agent_inactive() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(LodestarAgents, (admin.clone(),));
+        let client = LodestarAgentsClient::new(&env, &contract_id);
+
+        let agent_addr = Address::generate(&env);
+        let owner = Address::generate(&env);
+        setup_agent(&env, &contract_id, &agent_addr, &owner);
+        client.deactivate_agent(&agent_addr, &owner);
+
+        let result = client.try_get_score(&agent_addr);
+        assert!(result.is_err());
+        let err = result.unwrap_err().unwrap();
+        assert_eq!(err, AgentError::AgentInactive.into());
+    }
+
+    /// `get_score` must panic with `AgentError::AgentFlagged` (code 5) when
+    /// the agent exists but has been flagged by the admin.
+    #[test]
+    fn test_get_score_panics_agent_flagged() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(LodestarAgents, (admin.clone(),));
+        let client = LodestarAgentsClient::new(&env, &contract_id);
+
+        let agent_addr = Address::generate(&env);
+        let owner = Address::generate(&env);
+        setup_agent(&env, &contract_id, &agent_addr, &owner);
+        client.flag_agent(
+            &agent_addr,
+            &String::from_str(&env, "policy violation"),
+            &admin,
+        );
+
+        let result = client.try_get_score(&agent_addr);
+        assert!(result.is_err());
+        let err = result.unwrap_err().unwrap();
+        assert_eq!(err, AgentError::AgentFlagged.into());
+    }
+
+    /// `get_score` returns the live score and emits a `score_read` event for a
+    /// registered, active, unflagged agent.
+    #[test]
+    fn test_get_score_returns_score_for_active_agent() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(LodestarAgents, (admin,));
+        let client = LodestarAgentsClient::new(&env, &contract_id);
+
+        let agent_addr = Address::generate(&env);
+        let owner = Address::generate(&env);
+        setup_agent(&env, &contract_id, &agent_addr, &owner);
+
+        let score = client.get_score(&agent_addr);
+        assert_eq!(score, INITIAL_SCORE);
+    }
+
+    /// Removed test — `get_score` no longer returns -1 for unknown agents.
+    /// It now panics with `AgentError::AgentNotFound` (code 3).
+    /// The new behaviour is covered by `test_get_score_panics_agent_not_found`.
     #[test]
     fn test_get_score_emits_event_for_unknown_agent() {
         let env = Env::default();
@@ -1390,22 +1488,14 @@ mod test {
         let client = LodestarAgentsClient::new(&env, &contract_id);
 
         let missing = Address::generate(&env);
-        let score = client.get_score(&missing);
-        assert_eq!(score, -1);
-
-        let events = env.events().all();
-        assert_eq!(events.len(), 1);
-        let event = events.get(0).unwrap();
-        assert_eq!(
-            event.1,
-            (
-                Symbol::new(&env, "agents"),
-                Symbol::new(&env, "score_read"),
-                missing.clone(),
-            )
-                .into_val(&env)
-        );
-        assert_eq!(<(i32, bool)>::from_val(&env, &event.2), (-1i32, false));
+        // Must now return an error, not -1.
+        let result = client.try_get_score(&missing);
+        assert!(result.is_err());
+        let err = result.unwrap_err().unwrap();
+        assert_eq!(err, AgentError::AgentNotFound.into());
+        // No event is emitted because the call panicked before reaching the
+        // event publish statement.
+        assert_eq!(env.events().all().len(), 0);
     }
 
     #[test]
@@ -3139,7 +3229,9 @@ mod test {
         assert_eq!(flag_data.2, 95); // old_score
         assert_eq!(flag_data.3, 0); // new_score
         reconstructed_scores.push_back(flag_data.3);
-        assert_eq!(client.get_score(&agent_addr), 0);
+        // get_score now panics with AgentFlagged for flagged agents — verify that.
+        let flag_score_err = client.try_get_score(&agent_addr).unwrap_err().unwrap();
+        assert_eq!(flag_score_err, AgentError::AgentFlagged.into());
 
         assert_eq!(reconstructed_scores, vec![&env, 100, 110, 120, 95, 0]);
     }

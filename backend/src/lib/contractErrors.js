@@ -18,6 +18,31 @@ export const REGISTRY_ERROR_CODES = Object.freeze({
   15: { code: 'REGISTRY_STORAGE_CORRUPTED', message: 'Registry storage could not be read consistently' },
 });
 
+/**
+ * Stable numeric codes for the LodestarAgents contract errors.
+ *
+ * Each entry maps a Soroban contract error number (the `#repr(u32)` value of
+ * the `AgentError` enum in `contract/agents/src/lib.rs`) to a stable string
+ * `code` that the backend returns to callers, plus a human-readable `message`.
+ *
+ * Codes must never be reused or renumbered — add new variants at the end.
+ *
+ * | Code | Variant           | HTTP hint |
+ * |------|-------------------|-----------|
+ * |  1   | InvalidAmount     | 400       |
+ * |  2   | ArithmeticOverflow| 500       |
+ * |  3   | AgentNotFound     | 404       |
+ * |  4   | AgentInactive     | 403       |
+ * |  5   | AgentFlagged      | 403       |
+ */
+export const AGENTS_ERROR_CODES = Object.freeze({
+  1: { code: 'INVALID_AMOUNT', message: 'Payment amount must be a positive number of stroops', status: 400 },
+  2: { code: 'ARITHMETIC_OVERFLOW', message: 'Score or volume calculation overflowed', status: 500 },
+  3: { code: 'AGENT_NOT_FOUND', message: 'No agent is registered for this address', status: 404 },
+  4: { code: 'AGENT_INACTIVE', message: 'Agent has been deactivated', status: 403 },
+  5: { code: 'AGENT_FLAGGED', message: 'Agent has been flagged and cannot earn a score', status: 403 },
+});
+
 const REGISTRY_ERROR_PATTERNS = [
   /Error\(Contract,\s*#?(\d+)\)/i,
   /ContractError\((\d+)\)/i,
@@ -110,6 +135,37 @@ export function registryErrorFromCode(numericCode) {
 
 export function registryErrorFromHostError(details) {
   return registryErrorFromCode(extractRegistryErrorCode(details));
+}
+
+/**
+ * Build a ContractError from a numeric AgentError code.
+ *
+ * Returns `null` for unknown codes so callers can fall through to a generic
+ * error handler rather than swallowing unexpected values silently.
+ *
+ * @param {number} numericCode - The `#repr(u32)` value of the AgentError variant.
+ * @returns {ContractError|null}
+ */
+export function agentsErrorFromCode(numericCode) {
+  const meta = AGENTS_ERROR_CODES[numericCode];
+  if (!meta) return null;
+  const err = new ContractError(meta.message, meta.code);
+  err.agentsErrorCode = numericCode;
+  err.status = meta.status;
+  return err;
+}
+
+/**
+ * Extract an AgentError code from a Soroban host error and build a
+ * ContractError. Uses the same pattern-matching helpers as the registry
+ * equivalent so it handles structured objects, HostError strings, and
+ * numeric codes uniformly.
+ *
+ * @param {*} details - Error thrown by the Soroban RPC client.
+ * @returns {ContractError|null}
+ */
+export function agentsErrorFromHostError(details) {
+  return agentsErrorFromCode(extractRegistryErrorCode(details));
 }
 
 export class SimulationError extends ContractError {

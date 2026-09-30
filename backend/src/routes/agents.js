@@ -27,6 +27,7 @@ import { writeRateLimiter } from '../middleware/rateLimiter.js';
 import { validateAgentAddressParam, isValidStellarAddress } from '../middleware/addressValidator.js';
 import logger from '../lib/logger.js';
 import { handleContractError } from '../lib/ContractError.js';
+import { agentsErrorFromHostError } from '../lib/contractErrors.js';
 import {
   isValidIdempotencyKey,
   getEntry,
@@ -190,6 +191,12 @@ router.get('/agents/:address/score', requireAgentsContract, async (req, res) => 
     res.json({ score });
   } catch (err) {
     logger.error({ err }, 'GET /api/agents/:address/score failed');
+    // Map distinct AgentError variants to meaningful HTTP statuses so callers
+    // can tell the user what went wrong (not found vs flagged vs inactive).
+    const mapped = agentsErrorFromHostError(err);
+    if (mapped) {
+      return res.status(mapped.status).json({ error: mapped.message, code: mapped.code });
+    }
     return handleContractError(err, res, 'Failed to fetch score', 'FETCH_ERROR');
   }
 });
